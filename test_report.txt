@@ -1,0 +1,17 @@
+=== NETWORK SCAN REPORT ===
+Scan Time: 2025-09-12 22:06:58
+Total Hosts Scanned: 7
+Alive Hosts: 7
+
+=== DETECTION METHODS SUMMARY ===
+Ping        : 5 hosts
+Arp         : 2 hosts
+
+=== ALIVE HOSTS DETAILS ===
+192.168.1.6     | ping      
+192.168.1.2     | ping      
+192.168.1.1     | ping      
+192.168.1.9     | ping      
+192.168.1.14    | ping      
+192.168.1.16    | arp       
+192.168.1.15    | arp       
