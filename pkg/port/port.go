@@ -14,7 +14,7 @@ type Port struct {
 }
 
 func worker(ip string, ports, results chan Port) {
-	// This runs as a for {...} loop, waiting for input from the ports channel
+	// Comment: Runs as an infinite for loop, stucks waiting for input from the ports channel
 	for port := range ports {
 		address := net.JoinHostPort(ip, strconv.Itoa(port.Number))
 		conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
@@ -49,20 +49,20 @@ func ScanPorts(ip, portRange string) ([]Port, error) {
 	results := make(chan Port, maxPort)
 	var openPorts []Port
 
-	// This creates a pool of go routines expecting the channel input, any of those can handle the port thus creating parallelism in order to speed up the process
+	// Comment: This creates a pool of go routines expecting the channel input, any of those can handle the port thus creating parallelism in order to speed up the process
 	for range maxWorkers {
 		go worker(ip, ports, results)
 	}
 
 	go func() {
-		defer close(ports) // Chan is closed only after everything has been sent into it
+		defer close(ports)
 		for i := minPort; i <= maxPort; i++ {
 			ports <- Port{Number: i}
 		}
 	}()
 
 	for i := minPort; i <= maxPort; i++ {
-		port := <-results // This blocks execution until a worker sends a value to results channel
+		port := <-results // Comment: Blocks execution until a worker sends a value to results channel
 		if port.OK {
 			openPorts = append(openPorts, port)
 		}

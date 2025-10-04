@@ -1,6 +1,3 @@
-/*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
@@ -8,20 +5,23 @@ import (
 
 	"github.com/sfonzo96/monitor-go/pkg/network"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
-// networksCmd represents the networks command
 var networksCmd = &cobra.Command{
 	Use:   "networks",
 	Short: "List networks the host is connected to",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		nets, err := network.LookupLocalNetworks()
-		if err != nil {
-			return err
+		interval, _ := cmd.Flags().GetInt32("interval")
+
+		if interval == 0 || interval < 0 {
+			return fmt.Errorf("please provide a valid interval using --interval/-i flag")
 		}
 
-		for _, n := range nets {
-			fmt.Printf("Detected network: %s/%d\n", n.IPAddress, n.Mask)
+		err := network.LookupLocalNetworks(int(interval))
+		if err != nil {
+			fmt.Println(err)
+			return err
 		}
 
 		return nil
@@ -31,13 +31,7 @@ var networksCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(networksCmd)
 
-	// Here you will define your flags and configuration settings.
+	networksCmd.Flags().Int32P("interval", "i", 1, "Interval in minutes to lookup networks")
 
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// networksCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// networksCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	viper.BindPFlag("interval", networksCmd.Flags().Lookup("interval"))
 }

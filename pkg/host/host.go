@@ -2,37 +2,23 @@ package host
 
 import (
 	"fmt"
+	"math"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/sfonzo96/monitor-go/pkg/api"
 	"github.com/sfonzo96/monitor-go/pkg/database"
-	"github.com/sfonzo96/monitor-go/pkg/network"
 )
 
-type Network struct {
-	Id        int
-	IPAddress string
-	CIDRMask  int
-}
-
-// ScanConfig holds configuration for host scanning
-type ScanConfig struct {
-	Database   database.DatabaseInterface
-	APIClient  *api.Client
-	OutputFile string
-}
-
 type HostStatus struct {
-	IP       string
-	Alive    bool
-	Method   string // "ping", "arp", "port scan" or "none"
-	OpenPort int    // if detected via port scan
+	IP         string
+	Alive      bool
+	MACAddress string
 }
 
-// Simplified worker function - just processes and sends results
 func worker(ipChannel <-chan string, results chan<- HostStatus) {
 	for ip := range ipChannel {
 		status := isHostAlive(ip)
@@ -40,32 +26,26 @@ func worker(ipChannel <-chan string, results chan<- HostStatus) {
 	}
 }
 
-// Much cleaner implementation using only channels
-func scanNetwork(networkCIDR string) ([]HostStatus, error) {
-	const numWorkers = 500
-
-	_, ipnet, err := net.ParseCIDR(networkCIDR)
+func scanNetwork(network database.NetworkModel, knownHosts []database.HostModel) error {
+	_, ipnet, err := net.ParseCIDR(fmt.Sprintf("%s/%s", network.IPAddress, network.CIDRMask))
 	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR: %v", err)
+		return err
 	}
 
-	// Calculate expected IP count for progress tracking
 	ones, _ := ipnet.Mask.Size()
-	expectedCount := 1<<uint(32-ones) - 2
-	fmt.Printf("📊 Expected ~%d hosts to check in network %s\n", expectedCount, networkCIDR)
+	assignableIpsCount := int(math.Pow(2, float64(32-ones)) - 2)
 
-	// Create channels
 	ipChannel := make(chan string, 1000)
 	results := make(chan HostStatus, 1000)
 
-	// Start workers
+	const numWorkers = 500 // Comment: starts 500 goroutines waiting for ips in order to check if host is alive
 	for i := 0; i < numWorkers; i++ {
 		go worker(ipChannel, results)
 	}
 
-	// Start IP generator
 	go func() {
 		defer close(ipChannel)
+		// Comment: Generate all possible assignable IPs in the subnet (count should match assignableIpsCount)
 		for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
 			if !ip.Equal(ipnet.IP) && !isBroadcast(ip, ipnet) && ip.IsPrivate() {
 				ipChannel <- ip.String()
@@ -73,33 +53,57 @@ func scanNetwork(networkCIDR string) ([]HostStatus, error) {
 		}
 	}()
 
-	// Collect results with progress tracking
-	var aliveHosts []HostStatus
-	var aliveCount, checkedCount int
+	var checkedCount int
 
-	for checkedCount < expectedCount {
+	db, err := database.NewMySQLDatabase(fmt.Sprintf("%s:%s@tcp(%s)/%s",
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_NAME"),
+	))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for checkedCount < assignableIpsCount {
 		result := <-results
 		checkedCount++
 
-		if result.Alive {
-			aliveCount++
-			aliveHosts = append(aliveHosts, result)
-			fmt.Printf("%s ALIVE ✅ (%s)\n", result.IP, result.Method)
-		}
-
-		// Progress update every 5000 checks
-		if checkedCount%5000 == 0 {
-			msg := fmt.Sprintf("📈 Progress: %d/%d checked, %d alive (%.1f%% complete)\n",
-				checkedCount, expectedCount, aliveCount,
-				float64(checkedCount)/float64(expectedCount)*100)
-			fmt.Println(msg)
+		dbHost, exists := isKnownHost(result.MACAddress, result.IP, knownHosts)
+		if exists {
+			db.UpdateHostStatus(*dbHost.ID, result.Alive)
+		} else if result.Alive {
+			client := api.NewClient(os.Getenv("API_BASE_URL"))
+			newHost := api.NewHostRequest{
+				IPAddress:  result.IP,
+				MACAddress: result.MACAddress,
+				NetworkID:  *network.ID,
+				Hostname:   "unknown",
+			}
+			err := client.Post("/hosts", newHost)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
-	return aliveHosts, nil
+	return nil
 }
 
-// incrementIP increments an IP address by 1
+func isKnownHost(macAddress, ipAddress string, knownHosts []database.HostModel) (*database.HostModel, bool) {
+	for _, host := range knownHosts {
+		if macAddress != "none" {
+			if host.MACAddress == macAddress {
+				return &host, true
+			}
+		} else if host.IPAddress == ipAddress {
+			return &host, true
+		}
+	}
+	return nil, false
+}
+
+// Comment: incrementIP increments an IP address by 1
 func incrementIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -109,7 +113,6 @@ func incrementIP(ip net.IP) {
 	}
 }
 
-// isBroadcast checks if IP is the broadcast address for the network
 func isBroadcast(ip net.IP, ipnet *net.IPNet) bool {
 	broadcast := make(net.IP, len(ip))
 	for i := range ip {
@@ -118,340 +121,186 @@ func isBroadcast(ip net.IP, ipnet *net.IPNet) bool {
 	return ip.Equal(broadcast)
 }
 
-// pingHost attempts to ping a host using system ping command (faster timeout)
 func pingHost(ip string) bool {
-	cmd := exec.Command("ping", "-c", "1", "-W", "1", ip)
+	cmd := exec.Command("ping", "-c", "2", "-W", "2", ip)
 	err := cmd.Run()
 	return err == nil
 }
 
-func scanCommonPorts(ip string, ports []int, timeout time.Duration) (bool, int) {
+func scanCommonTCPPorts(ip string, ports []int, timeout time.Duration) bool {
 	for _, port := range ports {
 		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 		conn, err := net.DialTimeout("tcp", address, timeout)
 		if err == nil {
 			conn.Close()
-			return true, port
+			return true
 		}
 	}
-	return false, 0
+	return false
 }
 
-// isHostAlive checks if a host is alive using multiple detection methods
+func scanCommonUDPPorts(ip string, ports []int, timeout time.Duration) bool {
+	for _, port := range ports {
+		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("udp", address, timeout)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+	}
+	return false
+}
+
+var localIPsAndMacs, _ = getLocalIpsAndMacs()
+
 func isHostAlive(ip string) HostStatus {
-	status := HostStatus{IP: ip, Alive: false, Method: "none"}
+	commonTCPPorts := []int{22, 53, 80, 135, 139, 443, 445, 1433, 3389, 5353, 5985, 8080, 9389}
+	commonUDPPorts := []int{53, 67, 68, 123, 137, 161, 5353}
+	status := HostStatus{IP: ip, Alive: false, MACAddress: "none"}
 
-	// Method 1: Try ping first (fastest and most reliable on Linux hosts)
-	if pingHost(ip) {
+	if mac, isLocal := localIPsAndMacs[ip]; isLocal {
 		status.Alive = true
-		status.Method = "ping"
+		status.MACAddress = mac
+		fmt.Println("Host alive detected as local interface:", ip, "MAC:", mac)
 		return status
 	}
 
-	// Method 2: Port scan on common ports (especially Windows ports) - If fails it should enable a detection on ARP check
-	commonPorts := []int{22, 53, 80, 135, 139, 443, 445, 3389, 5353, 8080, 1433, 5985}
-	if alive, port := scanCommonPorts(ip, commonPorts, 200*time.Millisecond); alive {
-		status.Alive = true
-		status.Method = "port scan"
-		status.OpenPort = port
-		return status
-	}
+	// Comment: Combining methods so IP is added to arp table
+	pingHost(ip)
+	scanCommonTCPPorts(ip, commonTCPPorts, 300*time.Millisecond)
+	scanCommonUDPPorts(ip, commonUDPPorts, 300*time.Millisecond)
 
-	// Method 3: Check ARP table for recently contacted hosts
-	if checkARPTable(ip) {
+	if mac, ok := checkARPTable(ip); ok {
 		status.Alive = true
-		status.Method = "arp"
-		return status
+		status.MACAddress = mac
 	}
 
 	return status
 }
 
-// checkARPTable checks if the IP is in the ARP table (indicating recent network activity)
-func checkARPTable(ip string) bool {
+func checkARPTable(ip string) (string, bool) {
 	cmd := exec.Command("arp", "-n", ip)
 	output, err := cmd.Output()
 	if err != nil {
-		return false
+		return "none", false
 	}
 
 	outputStr := string(output)
-	// OK output example
+	// OK output example:
 	// Dirección                TipoHW  DirecciónHW         Indic Máscara         Interfaz
 	// 192.168.1.9              ether   08:00:27:0f:b6:d0   C                     enxf8e43b481329
 
 	// No entry output example
 	// 192.168.1.15 (192.168.1.15) -- no hay entradas
+	// or
+	// Dirección                TipoHW  DirecciónHW         Indic Máscara         Interfaz
+	// 192.168.1.14                     (incompleto)                              enxf8e43b481329
 
-	// Maybe not the most robust validation but works for now
-	if strings.Contains(outputStr, "--") {
-		return false
+	// Comment: Maybe not the most robust validation but works for now
+	if strings.Contains(outputStr, "--") || strings.Contains(outputStr, "(incompleto)") {
+		return "none", false
 	}
 
-	return strings.Contains(outputStr, ":") // : Belongs to mac addresses so I'm assuming if there's a ":" a MAC address is present
+	return extractMACFromARP(outputStr), strings.Contains(outputStr, ":") // Comment: ":"" Belongs to mac addresses so I'm assuming if there's a ":" a MAC address is present
 }
 
-func ScanHosts() ([]HostStatus, error) {
-	return ScanHostsWithConfig(nil)
-}
+func getLocalIpsAndMacs() (map[string]string, error) {
+	localInterfaces := make(map[string]string)
 
-// ScanHostsWithConfig scans hosts with database integration
-func ScanHostsWithConfig(config *ScanConfig) ([]HostStatus, error) {
-	networks, err := network.LookupLocalNetworks()
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get network interfaces: %w", err)
 	}
 
-	fmt.Printf("\n🔍 Total networks to scan: %d\n", len(networks))
-
-	// Sort networks by size (bigger mask = less hosts)
-	for i := 0; i < len(networks)-1; i++ {
-		for j := i + 1; j < len(networks); j++ {
-			if networks[i].Mask < networks[j].Mask {
-				networks[i], networks[j] = networks[j], networks[i]
-			}
-		}
-	}
-
-	var allAliveHosts []HostStatus
-	var knownHosts map[string]*database.Host
-
-	// Load known hosts from database if config is provided
-	if config != nil && config.Database != nil {
-		knownHosts, err = loadKnownHosts(config.Database)
-		if err != nil {
-			fmt.Printf("⚠️ Warning: Could not load known hosts from database: %v\n", err)
-			knownHosts = make(map[string]*database.Host)
-		}
-
-		// Check for new networks and post to API if configured
-		err = processNewNetworks(networks, config)
-		if err != nil {
-			fmt.Printf("⚠️ Warning: Failed to process networks: %v\n", err)
-		}
-	} else {
-		knownHosts = make(map[string]*database.Host)
-	}
-
-	// Process each network sequentially (smaller networks first)
-	for _, network := range networks {
-		// Create CIDR notation from IP and mask
-		networkCIDR := fmt.Sprintf("%s/%d", network.IPAddress, network.Mask)
-		fmt.Printf("\n🔍 Scanning network %s\n", networkCIDR)
-
-		// Check if this is a private network range
-		_, ipnet, err := net.ParseCIDR(networkCIDR)
-		if err != nil {
-			fmt.Printf("❌ Invalid CIDR %s: %v\n", networkCIDR, err)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
-		if !ipnet.IP.IsPrivate() {
-			fmt.Printf("⚠️  Skipping public network %s\n", networkCIDR)
+		if len(iface.HardwareAddr) == 0 {
 			continue
 		}
 
-		// Use worker pool to scan the network
-		aliveHosts, err := scanNetworkWithDatabase(networkCIDR, knownHosts, config)
+		addrs, err := iface.Addrs()
 		if err != nil {
-			fmt.Printf("❌ Error scanning network %s: %v\n", networkCIDR, err)
 			continue
 		}
 
-		// Add alive hosts from this network to the overall collection
-		allAliveHosts = append(allAliveHosts, aliveHosts...)
+		macAddr := iface.HardwareAddr.String()
 
-		fmt.Printf("✅ Network %s scan complete: %d hosts alive\n\n", networkCIDR, len(aliveHosts))
-	}
-	fmt.Println("\n🎉 All network scans completed!")
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
 
-	return allAliveHosts, nil
-}
-
-// loadKnownHosts loads all known hosts from the database into a map for quick lookup
-func loadKnownHosts(db database.DatabaseInterface) (map[string]*database.Host, error) {
-	hosts, err := db.GetHosts()
-	if err != nil {
-		return nil, err
-	}
-
-	knownHosts := make(map[string]*database.Host)
-	for i := range hosts {
-		knownHosts[hosts[i].IPAddress] = &hosts[i]
-	}
-
-	fmt.Printf("📊 Loaded %d known hosts from database\n", len(knownHosts))
-	return knownHosts, nil
-}
-
-// processNewNetworks checks for new networks and posts them to API if configured
-func processNewNetworks(localNetworks []network.Network, config *ScanConfig) error {
-	if config == nil || config.Database == nil {
-		return nil // No database configured
-	}
-
-	// Get known networks from database
-	knownNetworks, err := config.Database.GetNetworks()
-	if err != nil {
-		return fmt.Errorf("failed to load known networks: %w", err)
-	}
-
-	// Create map for fast lookup
-	knownNetworkMap := make(map[string]bool)
-	for _, known := range knownNetworks {
-		key := fmt.Sprintf("%s/%s", known.IPAddress, known.CIDRMask)
-		knownNetworkMap[key] = true
-	}
-
-	// Check each local network
-	for _, localNet := range localNetworks {
-		networkCIDR := fmt.Sprintf("%s/%d", localNet.IPAddress, localNet.Mask)
-
-		if !knownNetworkMap[networkCIDR] {
-			// New network discovered
-			fmt.Printf("🆕 New network discovered: %s\n", networkCIDR)
-
-			// Post to API if configured
-			if config.APIClient != nil {
-				newNetwork := api.NewNetworkRequest{
-					IPAddress:   localNet.IPAddress,
-					CIDRMask:    fmt.Sprintf("/%d", localNet.Mask),
-					Description: fmt.Sprintf("Auto-discovered network %s", networkCIDR),
-					IsOnline:    true,
-				}
-
-				err = config.APIClient.PostNewNetwork(newNetwork)
-				if err != nil {
-					fmt.Printf("⚠️ Warning: Failed to post network %s to API: %v\n", networkCIDR, err)
-				} else {
-					fmt.Printf("📡 Posted new network %s to API\n", networkCIDR)
-				}
+			if ipv4 := ipNet.IP.To4(); ipv4 != nil && !ipv4.IsLoopback() {
+				localInterfaces[ipv4.String()] = macAddr
 			}
 		}
 	}
 
-	return nil
+	return localInterfaces, nil
 }
 
-// processHostStatus handles the database logic for host discovery as described in notes
-func processHostStatus(status HostStatus, knownHosts map[string]*database.Host, config *ScanConfig) error {
-	if config == nil || config.Database == nil {
-		return nil // No database configured
+func extractMACFromARP(output string) string {
+	lines := strings.Split(output, "\n")
+	if len(lines) < 2 {
+		return "none"
 	}
 
-	knownHost, isKnown := knownHosts[status.IP]
+	fields := strings.Fields(lines[1])
+	if len(fields) < 3 {
+		return "none"
+	}
 
-	if isKnown {
-		// Host is known
-		if status.Alive {
-			// If host is alive, check if dbstatus is true
-			if !knownHost.IsOnline {
-				// Change dbstatus to true
-				err := config.Database.UpdateHostStatus(knownHost.ID, true, time.Now())
-				if err != nil {
-					return fmt.Errorf("failed to update host status to online: %w", err)
-				}
-				fmt.Printf("🔄 Updated host %s status to ONLINE\n", status.IP)
-			} else {
-				// Update last seen time
-				err := config.Database.UpdateHostLastSeen(knownHost.ID, time.Now())
-				if err != nil {
-					return fmt.Errorf("failed to update host last seen: %w", err)
-				}
-			}
-		} else {
-			// Host is not alive, change dbstatus to false
-			if knownHost.IsOnline {
-				err := config.Database.UpdateHostStatus(knownHost.ID, false, time.Now())
-				if err != nil {
-					return fmt.Errorf("failed to update host status to offline: %w", err)
-				}
-				fmt.Printf("🔄 Updated host %s status to OFFLINE\n", status.IP)
-			}
+	return fields[2]
+}
+
+func ScanHosts(interval int) error {
+	db, err := database.NewMySQLDatabase(fmt.Sprintf("%s:%s@tcp(%s)/%s",
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_NAME"),
+	))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	for {
+		networks, err := db.GetNetworks()
+		if err != nil {
+			return err
 		}
-	} else if status.Alive {
-		// New host discovered and alive - POST to API if configured
-		if config.APIClient != nil {
-			newHost := api.NewHostRequest{
-				IPAddress:  status.IP,
-				MACAddress: "", // We might need to enhance this to get MAC from ARP
-				NetworkID:  1,  // We might need to determine this based on the network
-				Hostname:   "", // We might need to do reverse DNS lookup
-				DetectedBy: status.Method,
-				OpenPort:   status.OpenPort,
-			}
 
-			err := config.APIClient.PostNewHost(newHost)
+		for _, network := range networks {
+			networkCIDR := fmt.Sprintf("%s/%s", network.IPAddress, network.CIDRMask)
+
+			_, ipnet, err := net.ParseCIDR(networkCIDR)
 			if err != nil {
-				return fmt.Errorf("failed to post new host to API: %w", err)
+				fmt.Println("Failed to parse CIDR:", err)
+				continue
 			}
-			fmt.Printf("📡 Posted new host %s to API (detected by %s)\n", status.IP, status.Method)
-		}
-	}
 
-	return nil
-}
+			if !ipnet.IP.IsPrivate() {
+				continue
+			}
 
-// scanNetworkWithDatabase is an enhanced version of scanNetwork with database integration
-func scanNetworkWithDatabase(networkCIDR string, knownHosts map[string]*database.Host, config *ScanConfig) ([]HostStatus, error) {
-	const numWorkers = 500
+			knownHosts, err := db.GetHostsByNetworkID(*network.ID)
+			if err != nil {
+				fmt.Println("Failed to get known hosts:", err)
+				continue
+			}
 
-	_, ipnet, err := net.ParseCIDR(networkCIDR)
-	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR: %v", err)
-	}
-
-	// Calculate expected IP count for progress tracking
-	ones, _ := ipnet.Mask.Size()
-	expectedCount := 1<<uint(32-ones) - 2
-	fmt.Printf("📊 Expected ~%d hosts to check in network %s\n", expectedCount, networkCIDR)
-
-	// Create channels
-	ipChannel := make(chan string, 1000)
-	results := make(chan HostStatus, 1000)
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		go worker(ipChannel, results)
-	}
-
-	// Start IP generator
-	go func() {
-		defer close(ipChannel)
-		for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
-			if !ip.Equal(ipnet.IP) && !isBroadcast(ip, ipnet) && ip.IsPrivate() {
-				ipChannel <- ip.String()
+			err = scanNetwork(network, knownHosts)
+			if err != nil {
+				fmt.Println("Failed to scan network:", err)
+				continue
 			}
 		}
-	}()
 
-	// Collect results with progress tracking and database integration
-	var aliveHosts []HostStatus
-	var aliveCount, checkedCount int
-
-	for checkedCount < expectedCount {
-		result := <-results
-		checkedCount++
-
-		// Process host status with database logic
-		if err := processHostStatus(result, knownHosts, config); err != nil {
-			fmt.Printf("⚠️ Warning: Failed to process host %s: %v\n", result.IP, err)
-		}
-
-		if result.Alive {
-			aliveCount++
-			aliveHosts = append(aliveHosts, result)
-			fmt.Printf("%s ALIVE ✅ (%s)\n", result.IP, result.Method)
-		}
-
-		// Progress update every 5000 checks
-		if checkedCount%5000 == 0 {
-			msg := fmt.Sprintf("📈 Progress: %d/%d checked, %d alive (%.1f%% complete)\n",
-				checkedCount, expectedCount, aliveCount,
-				float64(checkedCount)/float64(expectedCount)*100)
-			fmt.Println(msg)
-		}
+		time.Sleep(time.Duration(interval) * time.Minute)
 	}
-
-	return aliveHosts, nil
 }

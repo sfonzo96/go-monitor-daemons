@@ -1,177 +1,84 @@
-# Monitor-Go
+# monitor-go
 
-A high-performance network monitoring tool written in Go that discovers hosts on local networks with database persistence and API integration capabilities.
+## Purpose
 
-## 🚀 Quick Start
+A background monitoring service that collects system metrics, discovers networks and hosts, and scans for open ports. Works with the [php-monitor](https://github.com/sfonzo96/php-monitor) API to send collected data for centralized monitoring.
 
+## Features
+
+- **System Metrics**: CPU and memory usage monitoring
+- **Network Discovery**: Local network scanning and mapping
+- **Host Detection**: Active host identification on networks
+- **Port Scanning**: Open port detection on specific IP addresses
+- **API Integration**: Automatic data transmission with JWT authentication
+
+## Installation
+
+1. Clone this repository
+2. Install dependencies:
+   ```bash
+   go mod tidy
+   ```
+3. Build the application:
+   ```bash
+   go build -o monitor-go
+   ```
+
+## Configuration
+
+Create a `.env` file in the project root with the following variables:
+
+```
+API_BASE_URL=http://your-monitoring-api.com
+LOGIN_USER=your_username
+LOGIN_PASSWORD=your_password
+DB_HOST=localhost:3306
+DB_USER=database_user
+DB_PASSWORD=database_password
+DB_NAME=monitor_database
+```
+
+## Usage
+
+The application provides four main monitoring commands:
+
+### Collect System Metrics
 ```bash
-# Basic network scan
-./monitor-go hosts
-
-# Save results to file
-./monitor-go hosts --output scan_results.json
-
-# Full integration with database and API
-./monitor-go hosts \
-  --db-dsn "user:pass@tcp(localhost:3306)/monitor_db" \
-  --api-url "https://api.example.com" \
-  --api-key "your-api-key" \
-  --output comprehensive_report.json
+./monitor-go metrics --interval 30
 ```
+Collects system performance metrics every 30 seconds.
 
-## ✨ Features
-
-- **🔍 Multi-Method Host Detection**
-  - ICMP ping scanning
-  - TCP port scanning (common ports)
-  - ARP table lookup
-  - Concurrent scanning with 500 workers
-
-- **💾 Database Integration**
-  - MySQL support for host/network tracking
-  - Automatic status updates for known hosts
-  - Persistent host history with timestamps
-
-- **🌐 API Integration**
-  - HTTP client for external system notifications
-  - Automatic posting of new host/network discoveries
-  - Configurable authentication (API key support, JWT ready)
-
-- **📊 Flexible Reporting**
-  - JSON, CSV, and TXT output formats
-  - Detailed scan statistics and summaries
-  - Progress tracking for large networks
-
-- **⚡ High Performance**
-  - Concurrent scanning architecture
-  - Efficient worker pool pattern
-  - Graceful handling of network timeouts
-
-## 📋 Business Logic
-
-The application implements intelligent discovery management:
-
-- **Known Hosts** → Direct database updates (status changes, timestamps)
-- **New Hosts** → API notifications for business logic processing
-- **New Networks** → API notifications for infrastructure tracking
-- **Error Handling** → Graceful degradation, continues operation on partial failures
-
-## 🛠️ Installation & Setup
-
-### Prerequisites
-- Go 1.18+ 
-- MySQL database (optional)
-- Network access for scanning
-
-### Build from Source
+### Discover Networks
 ```bash
-git clone <repository>
-cd monitor-go
-go mod tidy
-go build -o monitor-go
+./monitor-go networks --interval 300
 ```
+Scans for available networks every 5 minutes.
 
-### Database Setup
-```sql
-CREATE DATABASE monitor_db;
--- See CONFIG.md for complete table schemas
-```
-
-## 📚 Documentation
-
-- **[CONFIG.md](CONFIG.md)** - Configuration examples and usage patterns
-- **[TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md)** - Complete technical documentation for developers
-- **[notes.md](notes.md)** - Development notes and completed features
-
-## 🔧 Configuration
-
-### Command Line Options
+### Scan for Hosts
 ```bash
-Flags:
-  --api-key string     API key for authentication
-  --api-url string     API base URL for posting discoveries
-  --db-dsn string      Database DSN (user:pass@tcp(host:port)/db)
-  -o, --output string  Output file (supports .json, .txt, .csv)
-  -h, --help           Help for hosts command
+./monitor-go hosts --interval 60
 ```
+Discovers active hosts every minute.
 
-### Environment Variables
+### Scan Ports
 ```bash
-export MONITOR_DB_DSN="user:pass@tcp(localhost:3306)/monitor_db"
-export MONITOR_API_URL="https://api.example.com"
-export MONITOR_API_KEY="your-api-key"
+./monitor-go ports --ip 192.168.1.100 --range 1-1024
 ```
+Scans ports 1-1024 on the specified IP address to identify open services.
 
-## 🎯 Use Cases
+## Dependencies
 
-### Network Administration
-- Automated host discovery and inventory
-- Network topology mapping
-- Change detection and alerting
+- Go 1.24.7 or later
+- github.com/shirou/gopsutil/v4 - System metrics collection
+- github.com/spf13/cobra - Command line interface
+- github.com/spf13/viper - Configuration management
+- github.com/joho/godotenv - Environment variable loading
+- github.com/go-sql-driver/mysql - Database connectivity
 
-### Security Monitoring  
-- Unauthorized device detection
-- Network access compliance
-- Infrastructure monitoring
+## License
 
-### DevOps Integration
-- Infrastructure as Code validation
-- Continuous infrastructure monitoring
-- API-driven network management
+This project is licensed under the terms specified in the LICENSE file.
 
-## 🚦 API Endpoints
+## Documentation
 
-Your external API should implement these endpoints:
-
-```bash
-POST /api/hosts     # New host discoveries
-POST /api/networks  # New network discoveries
-```
-
-See **[TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md)** for complete API payload specifications.
-
-## 🔄 Periodic Monitoring
-
-Set up automated scanning with cron:
-
-```bash
-# Every 30 minutes
-*/30 * * * * /path/to/monitor-go hosts --db-dsn "..." --api-url "..." --output /var/log/monitor/scan_$(date +\%Y\%m\%d_\%H\%M).json
-```
-
-## 🤝 Contributing
-
-This tool is designed for extensibility. Key extension points:
-
-- **Detection Methods** - Add new host discovery techniques
-- **Output Formats** - Implement additional report formats  
-- **Authentication** - Extend API client capabilities
-- **Database Backends** - Support additional database types
-
-See **[TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md)** for detailed modification instructions.
-
-## 📄 License
-
-See LICENSE file for details.
-
-## 🏗️ Architecture
-
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   CLI Command   │───▶│  Host Scanner    │───▶│   Report Gen    │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                              │                           │
-                              ▼                           ▼
-                    ┌──────────────────┐          ┌─────────────────┐
-                    │    Database      │          │   File Output   │
-                    │   (Known Hosts)  │          │ (JSON/CSV/TXT)  │
-                    └──────────────────┘          └─────────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │   External API   │
-                    │ (New Discoveries)│
-                    └──────────────────┘
-```
-
-Built with ❤️ in Go for network administrators and DevOps engineers.
+This README was generated by GitHub Copilot and reviewed by the project maintainer.
