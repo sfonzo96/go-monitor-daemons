@@ -17,6 +17,7 @@ type HostStatus struct {
 	IP         string
 	Alive      bool
 	MACAddress string
+	Hostname   string
 }
 
 func worker(ipChannel <-chan string, results chan<- HostStatus) {
@@ -38,7 +39,7 @@ func scanNetwork(network database.NetworkModel, knownHosts []database.HostModel)
 	ipChannel := make(chan string, 1000)
 	results := make(chan HostStatus, 1000)
 
-	const numWorkers = 500 // Comment: starts 500 goroutines waiting for ips in order to check if host is alive
+	const numWorkers = 1000 // Comment: starts 1000 goroutines waiting for ips in order to check if host is alive
 	for i := 0; i < numWorkers; i++ {
 		go worker(ipChannel, results)
 	}
@@ -46,8 +47,11 @@ func scanNetwork(network database.NetworkModel, knownHosts []database.HostModel)
 	go func() {
 		defer close(ipChannel)
 		// Comment: Generate all possible assignable IPs in the subnet (count should match assignableIpsCount)
-		for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
-			if !ip.Equal(ipnet.IP) && !isBroadcast(ip, ipnet) && ip.IsPrivate() {
+		ip := ipnet.IP.Mask(ipnet.Mask)
+		incrementIP(ip) // Skip network address
+		// Comment: Loop until we reach the broadcast address, in the meantime send all generated IPs to ipChannel
+		for ; ipnet.Contains(ip) && !isBroadcast(ip, ipnet); incrementIP(ip) {
+			if !ip.Equal(ipnet.IP) && ip.IsPrivate() {
 				ipChannel <- ip.String()
 			}
 		}
@@ -65,24 +69,33 @@ func scanNetwork(network database.NetworkModel, knownHosts []database.HostModel)
 		return err
 	}
 	defer db.Close()
+
 	for checkedCount < assignableIpsCount {
+		// Comment: Wait for results from workers (blocks until a result is available)
 		result := <-results
 		checkedCount++
 
+		if result.Alive {
+			fmt.Println("Scanned", network.IPAddress+"/"+network.CIDRMask, "->", result.IP, "Alive:", result.Alive, "MAC:", result.MACAddress, "Hostname:", result.Hostname)
+		}
+
 		dbHost, exists := isKnownHost(result.MACAddress, result.IP, knownHosts)
 		if exists {
+			// Comment: Missing ip change for the same mac address
 			db.UpdateHostStatus(*dbHost.ID, result.Alive)
 		} else if result.Alive {
+
 			client := api.NewClient(os.Getenv("API_BASE_URL"))
 			newHost := api.NewHostRequest{
 				IPAddress:  result.IP,
 				MACAddress: result.MACAddress,
 				NetworkID:  *network.ID,
-				Hostname:   "unknown",
+				Hostname:   result.Hostname,
 			}
-			err := client.Post("/hosts", newHost)
+			err = client.Post("/hosts", newHost)
 			if err != nil {
-				return err
+				continue
+				// return err
 			}
 		}
 	}
@@ -93,6 +106,7 @@ func scanNetwork(network database.NetworkModel, knownHosts []database.HostModel)
 func isKnownHost(macAddress, ipAddress string, knownHosts []database.HostModel) (*database.HostModel, bool) {
 	for _, host := range knownHosts {
 		if macAddress != "none" {
+			// Comment: Prefer matching by MAC address if available
 			if host.MACAddress == macAddress {
 				return &host, true
 			}
@@ -103,8 +117,19 @@ func isKnownHost(macAddress, ipAddress string, knownHosts []database.HostModel) 
 	return nil, false
 }
 
+func getHostName(ip string) (string, error) {
+	names, err := net.LookupAddr(ip)
+	if err != nil || len(names) == 0 {
+		return "unknown", err
+	}
+	return names[0], nil
+}
+
 // Comment: incrementIP increments an IP address by 1
 func incrementIP(ip net.IP) {
+	// Comment: increments last byte, while byte is less or equal than 255 it return on the first iteration
+	// Comment: if byte overflows to 0 it continues to the previous byte as ip[j] will be 0, therefore ip[j] > 0 is false and j is decremented.
+	// Comment: Recall that the ip reference is mutated in place
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
 		if ip[j] > 0 {
@@ -121,7 +146,7 @@ func isBroadcast(ip net.IP, ipnet *net.IPNet) bool {
 	return ip.Equal(broadcast)
 }
 
-func pingHost(ip string) bool {
+func PingHost(ip string) bool {
 	cmd := exec.Command("ping", "-c", "2", "-W", "2", ip)
 	err := cmd.Run()
 	return err == nil
@@ -156,7 +181,7 @@ var localIPsAndMacs, _ = getLocalIpsAndMacs()
 func isHostAlive(ip string) HostStatus {
 	commonTCPPorts := []int{22, 53, 80, 135, 139, 443, 445, 1433, 3389, 5353, 5985, 8080, 9389}
 	commonUDPPorts := []int{53, 67, 68, 123, 137, 161, 5353}
-	status := HostStatus{IP: ip, Alive: false, MACAddress: "none"}
+	status := HostStatus{IP: ip, Alive: false, MACAddress: "none", Hostname: "unknown"}
 
 	if mac, isLocal := localIPsAndMacs[ip]; isLocal {
 		status.Alive = true
@@ -166,15 +191,16 @@ func isHostAlive(ip string) HostStatus {
 	}
 
 	// Comment: Combining methods so IP is added to arp table
-	pingHost(ip)
+	PingHost(ip)
 	scanCommonTCPPorts(ip, commonTCPPorts, 300*time.Millisecond)
 	scanCommonUDPPorts(ip, commonUDPPorts, 300*time.Millisecond)
 
 	if mac, ok := checkARPTable(ip); ok {
 		status.Alive = true
 		status.MACAddress = mac
+		status.Hostname, _ = getHostName(ip)
 	}
-
+	// fmt.Println("Scanned IP:", ip, "Alive:", status.Alive, "MAC:", status.MACAddress)
 	return status
 }
 

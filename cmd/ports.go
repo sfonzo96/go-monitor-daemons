@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/sfonzo96/monitor-go/pkg/host"
 	"github.com/sfonzo96/monitor-go/pkg/port"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -18,13 +19,23 @@ var portsCmd = &cobra.Command{
 			return fmt.Errorf("please provide an IP address using --ip/-ip flag")
 		}
 
+		// Is online:
+		if !host.PingHost(ip) {
+			fmt.Println("Host is offline or unreachable:", ip)
+			return nil
+		}
 		ports, err := port.ScanPorts(ip, viper.GetString("range"))
 		if err != nil {
 			return err
 		}
 
+		if ports == nil {
+			fmt.Println("No open ports found for", ip)
+			return nil
+		}
+		fmt.Println("Open ports for", ip, ":")
 		for _, p := range ports {
-			fmt.Printf("%d  ", p.Number)
+			fmt.Println("-", p.Number)
 		}
 
 		return nil

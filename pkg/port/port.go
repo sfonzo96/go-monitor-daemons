@@ -71,7 +71,7 @@ func ScanPorts(ip, portRange string) ([]Port, error) {
 	close(results)
 
 	if len(openPorts) < 1 {
-		fmt.Println("No open ports found")
+		// fmt.Println("No open ports found")
 		return nil, nil
 	}
 
